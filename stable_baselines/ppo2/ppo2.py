@@ -68,8 +68,11 @@ class PPO2(ActorCriticRLModel):
         self.noptepochs = noptepochs
         self.tensorboard_log = tensorboard_log
         self.full_tensorboard_log = full_tensorboard_log
-        self.cx = 1
-        
+        self.cx = 0.001
+        self.reward_log = {}
+        self.max_reward = float('-inf')
+        self.rewardt = 0
+
         self.action_ph = None
         self.advs_ph = None
         self.rewards_ph = None
@@ -144,7 +147,8 @@ class PPO2(ActorCriticRLModel):
                     self.old_vpred_ph = tf.placeholder(tf.float32, [None], name="old_vpred_ph")
                     self.learning_rate_ph = tf.placeholder(tf.float32, [], name="learning_rate_ph")
                     self.clip_range_ph = tf.placeholder(tf.float32, [], name="clip_range_ph")
-                    self.old_cx_ph = tf.placeholder(tf.float32, [], name="old_cx_ph")
+                    self.max_reward_ph = tf.placeholder(tf.float32, [], name="max_reward_ph")
+                    self.rewardt_ph = tf.placeholder(tf.float32, [], name="rewardt_ph")
 
                     neglogpac = train_model.proba_distribution.neglogp(self.action_ph)
                     self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
@@ -180,9 +184,8 @@ class PPO2(ActorCriticRLModel):
                     self.vf_loss = .5 * tf.reduce_mean(tf.maximum(vf_losses1, vf_losses2))
 
                     ratio = tf.exp(self.old_neglog_pac_ph - neglogpac)
-                    d = tf.reduce_mean(tf.abs(ratio-1))
-                    self.new_cx = (1-0.001)*self.old_cx_ph+0.001*d
-                    self.new_ent_coef = tf.maximum(self.ent_coef, (0.2-20*self.new_cx))
+                    reward_correlation = tf.maximum(self.ent_coef, 0.1*(self.max_reward_ph-self.rewardt_ph)/(self.max_reward_ph+1e-5))
+                    self.new_ent_coef = tf.minimum(0.2, reward_correlation)
                     pg_losses = -self.advs_ph * ratio
                     pg_losses2 = -self.advs_ph * tf.clip_by_value(ratio, 1.0 - self.clip_range_ph, 1.0 +
                                                                   self.clip_range_ph)
@@ -199,9 +202,10 @@ class PPO2(ActorCriticRLModel):
                     tf.summary.scalar('clip_factor', self.clipfrac)
                     tf.summary.scalar('loss', loss)
                     tf.summary.scalar('entropy_coef', self.new_ent_coef)
-                    tf.summary.scalar('cx', self.new_cx)
-                    tf.summary.scalar('d', d)
                     tf.summary.scalar('ratio', tf.reduce_mean(ratio))
+                    tf.summary.scalar('Rm', self.max_reward_ph)
+                    tf.summary.scalar('Rt', self.rewardt_ph)
+                    tf.summary.scalar('Rc', reward_correlation)
 
 
                     with tf.variable_scope('model'):
@@ -251,7 +255,7 @@ class PPO2(ActorCriticRLModel):
 
                 self.summary = tf.summary.merge_all()
 
-    def _train_step(self, learning_rate, cliprange, obs, returns, masks, actions, values, neglogpacs, update,
+    def _train_step(self, learning_rate, cliprange, obs, returns, masks, actions, values, neglogpacs, true_reward, update,
                     writer, states=None, cliprange_vf=None):
         """
         Training of PPO2 Algorithm
@@ -271,13 +275,26 @@ class PPO2(ActorCriticRLModel):
                 approximation of kl divergence, updated clipping range, training update operation
         :param cliprange_vf: (float) Clipping factor for the value function
         """
+        batch = 50
+        reward_correlation = 0
+        max_reward = self.rewardt = (1-0.005)*self.rewardt+0.005*np.mean(true_reward)
+        if self.rewardt > self.max_reward:
+            self.max_reward = self.rewardt
+        if self.num_timesteps >= batch*self.n_steps*self.n_envs:
+            self.reward_log[self.num_timesteps]=self.max_reward
+        if self.num_timesteps >= 2*batch*self.n_steps*self.n_envs:
+            t = self.num_timesteps - batch*self.n_steps*self.n_envs
+            max_reward = self.reward_log[t]
+            self.reward_log.pop(t-self.n_steps*self.n_envs, None)
+
+
         advs = returns - values
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
         td_map = {self.train_model.obs_ph: obs, self.action_ph: actions,
                   self.advs_ph: advs, self.rewards_ph: returns,
                   self.learning_rate_ph: learning_rate, self.clip_range_ph: cliprange,
                   self.old_neglog_pac_ph: neglogpacs, self.old_vpred_ph: values,
-                  self.old_cx_ph: self.cx}
+                  self.max_reward_ph: max_reward, self.rewardt_ph: self.rewardt}
         if states is not None:
             td_map[self.train_model.states_ph] = states
             td_map[self.train_model.dones_ph] = masks
@@ -295,18 +312,18 @@ class PPO2(ActorCriticRLModel):
             if self.full_tensorboard_log and (1 + update) % 10 == 0:
                 run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                 run_metadata = tf.RunMetadata()
-                self.cx, summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.new_cx, self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
                     td_map, options=run_options, run_metadata=run_metadata)
                 writer.add_run_metadata(run_metadata, 'step%d' % (update * update_fac))
             else:
-                self.cx, summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.new_cx, self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
                     td_map)
             writer.add_summary(summary, (update * update_fac))
         else:
-            self.cx, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                [self.new_cx, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train], td_map)
+            policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                [self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train], td_map)
 
         return policy_loss, value_loss, policy_entropy, approxkl, clipfrac
 
@@ -320,7 +337,7 @@ class PPO2(ActorCriticRLModel):
         new_tb_log = self._init_num_timesteps(reset_num_timesteps)
         callback = self._init_callback(callback)
 
-        with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name+"_RATIO", new_tb_log) \
+        with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name+"_REWARD", new_tb_log) \
                 as writer:
             self._setup_learn()
 
@@ -366,7 +383,7 @@ class PPO2(ActorCriticRLModel):
                                                                             self.n_batch + start) // batch_size)
                             end = start + batch_size
                             mbinds = inds[start:end]
-                            slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
+                            slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, neglogpacs, true_reward))
                             mb_loss_vals.append(self._train_step(lr_now, cliprange_now, *slices, writer=writer,
                                                                  update=timestep, cliprange_vf=cliprange_vf_now))
                 else:  # recurrent version
@@ -383,7 +400,7 @@ class PPO2(ActorCriticRLModel):
                             end = start + envs_per_batch
                             mb_env_inds = env_indices[start:end]
                             mb_flat_inds = flat_indices[mb_env_inds].ravel()
-                            slices = (arr[mb_flat_inds] for arr in (obs, returns, masks, actions, values, neglogpacs))
+                            slices = (arr[mb_flat_inds] for arr in (obs, returns, masks, actions, values, neglogpacs, true_reward))
                             mb_states = states[mb_env_inds]
                             mb_loss_vals.append(self._train_step(lr_now, cliprange_now, *slices, update=timestep,
                                                                  writer=writer, states=mb_states,
