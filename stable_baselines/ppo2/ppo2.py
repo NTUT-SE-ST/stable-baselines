@@ -68,7 +68,7 @@ class PPO2(ActorCriticRLModel):
         self.noptepochs = noptepochs
         self.tensorboard_log = tensorboard_log
         self.full_tensorboard_log = full_tensorboard_log
-        self.cx = 0.001
+        self.cx = 1
         self.reward_log = {}
         self.max_reward = float('-inf')
         self.rewardt = 0
@@ -147,6 +147,7 @@ class PPO2(ActorCriticRLModel):
                     self.old_vpred_ph = tf.placeholder(tf.float32, [None], name="old_vpred_ph")
                     self.learning_rate_ph = tf.placeholder(tf.float32, [], name="learning_rate_ph")
                     self.clip_range_ph = tf.placeholder(tf.float32, [], name="clip_range_ph")
+                    self.old_cx_ph = tf.placeholder(tf.float32, [], name="old_cx_ph")
                     self.max_reward_ph = tf.placeholder(tf.float32, [], name="max_reward_ph")
                     self.rewardt_ph = tf.placeholder(tf.float32, [], name="rewardt_ph")
 
@@ -184,8 +185,11 @@ class PPO2(ActorCriticRLModel):
                     self.vf_loss = .5 * tf.reduce_mean(tf.maximum(vf_losses1, vf_losses2))
 
                     ratio = tf.exp(self.old_neglog_pac_ph - neglogpac)
+                    d = tf.reduce_mean(tf.abs(ratio-1))
                     reward_correlation = tf.maximum(self.ent_coef, 0.1*(self.max_reward_ph-self.rewardt_ph)/(self.max_reward_ph+1e-5))
-                    self.new_ent_coef = tf.minimum(0.2, reward_correlation)
+                    self.new_cx = (1-0.001)*self.old_cx_ph+0.001*d
+                    ratio_reward = tf.maximum((0.2-20*self.new_cx), reward_correlation)
+                    self.new_ent_coef = tf.minimum(0.2, tf.maximum(self.ent_coef, ratio_reward))
                     pg_losses = -self.advs_ph * ratio
                     pg_losses2 = -self.advs_ph * tf.clip_by_value(ratio, 1.0 - self.clip_range_ph, 1.0 +
                                                                   self.clip_range_ph)
@@ -202,6 +206,8 @@ class PPO2(ActorCriticRLModel):
                     tf.summary.scalar('clip_factor', self.clipfrac)
                     tf.summary.scalar('loss', loss)
                     tf.summary.scalar('entropy_coef', self.new_ent_coef)
+                    tf.summary.scalar('cx', self.new_cx)
+                    tf.summary.scalar('d', d)
                     tf.summary.scalar('ratio', tf.reduce_mean(ratio))
                     tf.summary.scalar('Rm', self.max_reward_ph)
                     tf.summary.scalar('Rt', self.rewardt_ph)
@@ -275,7 +281,7 @@ class PPO2(ActorCriticRLModel):
                 approximation of kl divergence, updated clipping range, training update operation
         :param cliprange_vf: (float) Clipping factor for the value function
         """
-        batch = 50
+        batch=200
         reward_correlation = 0
         max_reward = self.rewardt = (1-0.005)*self.rewardt+0.005*np.mean(true_reward)
         if self.rewardt > self.max_reward:
@@ -287,14 +293,14 @@ class PPO2(ActorCriticRLModel):
             max_reward = self.reward_log[t]
             self.reward_log.pop(t-self.n_steps*self.n_envs, None)
 
-
         advs = returns - values
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
         td_map = {self.train_model.obs_ph: obs, self.action_ph: actions,
                   self.advs_ph: advs, self.rewards_ph: returns,
                   self.learning_rate_ph: learning_rate, self.clip_range_ph: cliprange,
                   self.old_neglog_pac_ph: neglogpacs, self.old_vpred_ph: values,
-                  self.max_reward_ph: max_reward, self.rewardt_ph: self.rewardt}
+                  self.old_cx_ph: self.cx, self.max_reward_ph: max_reward,
+                  self.rewardt_ph: self.rewardt}
         if states is not None:
             td_map[self.train_model.states_ph] = states
             td_map[self.train_model.dones_ph] = masks
@@ -312,18 +318,18 @@ class PPO2(ActorCriticRLModel):
             if self.full_tensorboard_log and (1 + update) % 10 == 0:
                 run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                 run_metadata = tf.RunMetadata()
-                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                self.cx, summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                    [self.new_cx, self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
                     td_map, options=run_options, run_metadata=run_metadata)
                 writer.add_run_metadata(run_metadata, 'step%d' % (update * update_fac))
             else:
-                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                self.cx, summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                    [self.new_cx, self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
                     td_map)
             writer.add_summary(summary, (update * update_fac))
         else:
-            policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                [self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train], td_map)
+            self.cx, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
+                [self.new_cx, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train], td_map)
 
         return policy_loss, value_loss, policy_entropy, approxkl, clipfrac
 
@@ -337,7 +343,7 @@ class PPO2(ActorCriticRLModel):
         new_tb_log = self._init_num_timesteps(reset_num_timesteps)
         callback = self._init_callback(callback)
 
-        with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name+"_REWARD", new_tb_log) \
+        with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name+"_REWRAD+RATIO", new_tb_log) \
                 as writer:
             self._setup_learn()
 
