@@ -188,8 +188,7 @@ class PPO2(ActorCriticRLModel):
                     d = tf.reduce_mean(tf.abs(ratio-1))
                     reward_correlation = tf.maximum(self.ent_coef, 0.1*(self.max_reward_ph-self.rewardt_ph)/(self.max_reward_ph+1e-5))
                     self.new_cx = (1-0.001)*self.old_cx_ph+0.001*d
-                    ratio_reward = tf.maximum((0.2-20*self.new_cx), reward_correlation)
-                    self.new_ent_coef = tf.minimum(0.2, tf.maximum(self.ent_coef, ratio_reward))
+                    self.new_ent_coef = tf.minimum(0.2, tf.maximum(self.ent_coef, (0.2-20*self.new_cx)*reward_correlation))
                     pg_losses = -self.advs_ph * ratio
                     pg_losses2 = -self.advs_ph * tf.clip_by_value(ratio, 1.0 - self.clip_range_ph, 1.0 +
                                                                   self.clip_range_ph)
@@ -343,7 +342,7 @@ class PPO2(ActorCriticRLModel):
         new_tb_log = self._init_num_timesteps(reset_num_timesteps)
         callback = self._init_callback(callback)
 
-        with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name+"_REWRAD+RATIO", new_tb_log) \
+        with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name+"_RATIO+REWARD-MUL", new_tb_log) \
                 as writer:
             self._setup_learn()
 
