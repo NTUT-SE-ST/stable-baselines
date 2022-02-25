@@ -222,7 +222,7 @@ class ACKTR(ActorCriticRLModel):
 
                 self.summary = tf.summary.merge_all()
 
-    def _train_step(self, obs, states, rewards, masks, actions, values, update, writer):
+    def _train_step(self, obs, states, rewards, masks, actions, values, action_masks, update, writer):
         """
         applies a training step to the model
 
@@ -232,6 +232,7 @@ class ACKTR(ActorCriticRLModel):
         :param masks: ([bool]) Whether or not the episode is over (used for recurrent policies)
         :param actions: ([float]) The actions taken
         :param values: ([float]) The logits values
+        :param action_masks: (np.ndarray) Mask invalid actions
         :param update: (int) the current step iteration
         :param writer: (TensorFlow Summary.writer) the writer for tensorboard
         :return: (float, float, float) policy loss, value loss, policy entropy
@@ -256,6 +257,7 @@ class ACKTR(ActorCriticRLModel):
             self.actions_ph: actions,
             self.advs_ph: advs,
             self.rewards_ph: rewards,
+            self.train_model.action_mask_ph: action_masks,
             self.learning_rate_ph: current_lr
         }
 
@@ -338,10 +340,10 @@ class ACKTR(ActorCriticRLModel):
                 if isinstance(self.runner, PPO2Runner):
                     # We are using GAE
                     rollout = self.runner.run(callback)
-                    obs, returns, masks, actions, values, _, states, ep_infos, true_reward = rollout
+                    obs, returns, masks, actions, values, _, states, ep_infos, true_reward, action_masks = rollout
                 else:
                     rollout = self.runner.run(callback)
-                    obs, states, returns, masks, actions, values, ep_infos, true_reward = rollout
+                    obs, states, returns, masks, actions, values, ep_infos, true_reward, action_masks = rollout
                 # pytype:enable=bad-unpacking
                 callback.update_locals(locals())
                 callback.on_rollout_end()
@@ -351,7 +353,7 @@ class ACKTR(ActorCriticRLModel):
                     break
 
                 self.ep_info_buf.extend(ep_infos)
-                policy_loss, value_loss, policy_entropy = self._train_step(obs, states, returns, masks, actions, values,
+                policy_loss, value_loss, policy_entropy = self._train_step(obs, states, returns, masks, actions, values, action_masks,
                                                                            self.num_timesteps // (self.n_batch + 1),
                                                                            writer)
                 n_seconds = time.time() - t_start

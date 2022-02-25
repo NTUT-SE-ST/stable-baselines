@@ -12,6 +12,7 @@
 __pycache__/
 _build/
 *.npz
+.vscode/
 *.zip
 
 # Setuptools distribution and build folders.

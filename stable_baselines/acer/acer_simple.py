@@ -3,7 +3,7 @@ import warnings
 
 import numpy as np
 import tensorflow as tf
-from gym.spaces import Discrete, Box
+from gym.spaces import Discrete, Box, MultiDiscrete
 from collections import deque
 
 from stable_baselines import logger
@@ -14,6 +14,7 @@ from stable_baselines.acer.buffer import Buffer
 from stable_baselines.common import ActorCriticRLModel, tf_util, SetVerbosity, TensorboardWriter
 from stable_baselines.common.runners import AbstractEnvRunner
 from stable_baselines.common.policies import ActorCriticPolicy, RecurrentActorCriticPolicy
+from stable_baselines.common.misc_util import flatten_action_mask
 
 
 # For ACER
@@ -505,7 +506,7 @@ class ACER(ActorCriticRLModel):
 
                 self.summary = tf.summary.merge_all()
 
-    def _train_step(self, obs, actions, rewards, dones, mus, states, masks, steps, writer=None):
+    def _train_step(self, obs, actions, rewards, dones, mus, states, masks, steps, action_masks, writer=None):
         """
         applies a training step to the model
 
@@ -517,12 +518,14 @@ class ACER(ActorCriticRLModel):
         :param states: ([float]) The states (used for recurrent policies)
         :param masks: ([bool]) Whether or not the episode is over (used for recurrent policies)
         :param steps: (int) the number of steps done so far (can be None)
+        :param action_masks: (np.ndarray) Mask invalid actions
         :param writer: (TensorFlow Summary.writer) the writer for tensorboard
         :return: ([str], [float]) the list of update operation name, and the list of the results of the operations
         """
         cur_lr = self.learning_rate_schedule.value_steps(steps)
         td_map = {self.train_model.obs_ph: obs, self.polyak_model.obs_ph: obs, self.action_ph: actions,
-                  self.reward_ph: rewards, self.done_ph: dones, self.mu_ph: mus, self.learning_rate_ph: cur_lr}
+                  self.reward_ph: rewards, self.done_ph: dones, self.train_model.action_mask_ph: action_masks,
+                  self.mu_ph: mus, self.learning_rate_ph: cur_lr}
 
         if states is not None:
             td_map[self.train_model.states_ph] = states
@@ -575,7 +578,7 @@ class ACER(ActorCriticRLModel):
 
                 callback.on_rollout_start()
 
-                enc_obs, obs, actions, rewards, mus, dones, masks = self.runner.run(callback)
+                enc_obs, obs, actions, rewards, mus, dones, masks, action_masks = self.runner.run(callback)
                 callback.update_locals(locals())
                 callback.on_rollout_end()
 
@@ -601,9 +604,10 @@ class ACER(ActorCriticRLModel):
                 mus = mus.reshape([self.n_batch, self.n_act])
                 dones = dones.reshape([self.n_batch])
                 masks = masks.reshape([self.runner.batch_ob_shape[0]])
+                action_masks = action_masks.reshape(self.runner.action_mask_shape)
 
                 names_ops, values_ops = self._train_step(obs, actions, rewards, dones, mus, self.initial_state, masks,
-                                                         self.num_timesteps, writer)
+                                                         self.num_timesteps, action_masks, writer)
 
                 if self.verbose >= 1 and (int(steps / self.n_batch) % log_interval == 0):
                     logger.record_tabular("total_timesteps", self.num_timesteps)
@@ -632,9 +636,10 @@ class ACER(ActorCriticRLModel):
                         mus = mus.reshape([self.n_batch, self.n_act])
                         dones = dones.reshape([self.n_batch])
                         masks = masks.reshape([self.runner.batch_ob_shape[0]])
+                        action_masks = action_masks.reshape(self.runner.action_mask_shape)
 
                         self._train_step(obs, actions, rewards, dones, mus, self.initial_state, masks,
-                                         self.num_timesteps)
+                                         self.num_timesteps, action_masks)
 
         callback.on_training_end()
 
@@ -720,19 +725,20 @@ class _Runner(AbstractEnvRunner):
                  encoded observation, observations, actions, rewards, mus, dones, masks
         """
         enc_obs = [self.obs]
-        mb_obs, mb_actions, mb_mus, mb_dones, mb_rewards = [], [], [], [], []
+        mb_obs, mb_actions, mb_mus, mb_dones, mb_rewards, mb_action_masks = [], [], [], [], [], []
         for _ in range(self.n_steps):
-            actions, _, states, _ = self.model.step(self.obs, self.states, self.dones)
+            actions, _, states, _ = self.model.step(self.obs, self.states, self.dones, action_mask=self.action_masks)
             mus = self.model.proba_step(self.obs, self.states, self.dones)
             mb_obs.append(np.copy(self.obs))
             mb_actions.append(actions)
             mb_mus.append(mus)
             mb_dones.append(self.dones)
+            mb_action_masks.append(self.action_masks.copy())
             clipped_actions = actions
             # Clip the actions to avoid out of bound error
             if isinstance(self.env.action_space, Box):
                 clipped_actions = np.clip(actions, self.env.action_space.low, self.env.action_space.high)
-            obs, rewards, dones, _ = self.env.step(clipped_actions)
+            obs, rewards, dones, infos = self.env.step(clipped_actions)
 
             self.model.num_timesteps += self.n_envs
 
@@ -742,7 +748,13 @@ class _Runner(AbstractEnvRunner):
                 if self.callback.on_step() is False:
                     self.continue_training = False
                     # Return dummy values
-                    return [None] * 7
+                    return [None] * 8
+
+            self.action_masks.clear()
+            for info in infos:
+                # actoin mask
+                env_action_mask = info.get('action_mask')
+                self.action_masks.append(flatten_action_mask(self.env.action_space, env_action_mask))
 
             # states information for statefull models like LSTM
             self.states = states
@@ -752,6 +764,7 @@ class _Runner(AbstractEnvRunner):
             enc_obs.append(obs)
         mb_obs.append(np.copy(self.obs))
         mb_dones.append(self.dones)
+        mb_action_masks.append(self.action_masks.copy())
 
         enc_obs = np.asarray(enc_obs, dtype=self.obs_dtype).swapaxes(1, 0)
         mb_obs = np.asarray(mb_obs, dtype=self.obs_dtype).swapaxes(1, 0)
@@ -759,6 +772,7 @@ class _Runner(AbstractEnvRunner):
         mb_rewards = np.asarray(mb_rewards, dtype=np.float32).swapaxes(1, 0)
         mb_mus = np.asarray(mb_mus, dtype=np.float32).swapaxes(1, 0)
         mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(1, 0)
+        mb_action_masks = np.asfarray(mb_action_masks, dtype=np.float32).swapaxes(1, 0)
 
         mb_masks = mb_dones  # Used for statefull models like LSTM's to mask state when done
         mb_dones = mb_dones[:, 1:]  # Used for calculating returns. The dones array is now aligned with rewards
@@ -766,4 +780,4 @@ class _Runner(AbstractEnvRunner):
         # shapes are now [nenv, nsteps, []]
         # When pulling from buffer, arrays will now be reshaped in place, preventing a deep copy.
 
-        return enc_obs, mb_obs, mb_actions, mb_rewards, mb_mus, mb_dones, mb_masks
+        return enc_obs, mb_obs, mb_actions, mb_rewards, mb_mus, mb_dones, mb_masks, mb_action_masks

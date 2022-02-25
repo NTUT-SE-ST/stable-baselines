@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from gym.spaces import Discrete, MultiDiscrete
 import typing
 from typing import Union, Optional, Any
 
@@ -35,6 +36,16 @@ class AbstractEnvRunner(ABC):
         self.callback = None  # type: Optional[BaseCallback]
         self.continue_training = True
         self.n_envs = n_envs
+
+        if isinstance(self.env.action_space, MultiDiscrete):
+            self.action_mask_shape = (self.n_envs * (n_steps + 1), sum(self.env.action_space.nvec))
+            self.action_masks = [np.ones(sum(self.env.action_space.nvec)) for _ in range(self.n_envs)]
+        elif isinstance(self.env.action_space, Discrete):
+            self.action_mask_shape = (self.n_envs * (n_steps + 1), self.env.action_space.n)
+            self.action_masks = [np.ones(self.env.action_space.n) for _ in range(self.n_envs)]
+        else:
+            self.action_mask_shape = (self.n_envs * (n_steps + 1),)
+            self.action_masks = [None for _ in range(self.n_envs)] 
 
     def run(self, callback: Optional[BaseCallback] = None) -> Any:
         """

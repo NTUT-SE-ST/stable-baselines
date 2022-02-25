@@ -37,6 +37,9 @@ jobs:
     - name: "Unit Tests determinism"
       env: TEST_GLOB="0deterministic.py"
 
+    - name: "Unit Tests action mask"
+      env: TEST_GLOB="0action_mask.py"
+
     - name: "Sphinx Documentation"
       script:
         - 'docker run -it --rm --mount src=$(pwd),target=/root/code/stable-baselines,type=bind ${DOCKER_IMAGE} bash -c "cd /root/code/stable-baselines/ && pushd docs/ && make clean && make html"'
