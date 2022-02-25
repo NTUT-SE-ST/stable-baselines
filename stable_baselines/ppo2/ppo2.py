@@ -301,7 +301,11 @@ class PPO2(ActorCriticRLModel):
                 [self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train], td_map)
 
         return policy_loss, value_loss, policy_entropy, approxkl, clipfrac
-
+    
+    def set_env(self,env):
+        super().set_env(env)
+        self.n_batch = self.n_envs * self.n_steps
+    
     def learn(self, total_timesteps, callback=None, log_interval=1, tb_log_name="PPO2",
               reset_num_timesteps=True):
         # Transform to callable if needed
@@ -472,7 +476,7 @@ class Runner(AbstractEnvRunner):
         mb_states = self.states
         ep_infos = []
         for _ in range(self.n_steps):
-            actions, values, self.states, neglogpacs = self.model.step(self.obs, self.states, self.dones, action_mask=self.action_masks)
+            actions, values, self.states, neglogpacs = self.model.step(self.obs, self.states, self.dones, action_mask=self.action_masks)  # pytype: disable=attribute-error
             mb_obs.append(self.obs.copy())
             mb_actions.append(actions)
             mb_values.append(values)
@@ -514,7 +518,7 @@ class Runner(AbstractEnvRunner):
         mb_neglogpacs = np.asarray(mb_neglogpacs, dtype=np.float32)
         mb_dones = np.asarray(mb_dones, dtype=np.bool)
         mb_action_masks = np.asfarray(mb_action_masks, dtype=np.float32)
-        last_values = self.model.value(self.obs, self.states, self.dones)
+        last_values = self.model.value(self.obs, self.states, self.dones)  # pytype: disable=attribute-error
         # discount/bootstrap off value fn
         mb_advs = np.zeros_like(mb_rewards)
         true_reward = np.copy(mb_rewards)
